@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SOMOS · Doodle Jump</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; background:#0a0a1a; overflow:hidden; font-family:'Courier New',monospace; user-select:none; }
+  #wrap { display:flex; flex-direction:column; width:100%; height:100%; }
+  #hud { flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:3px 10px; font-size:11px; color:#00f5ff; letter-spacing:1px; background:#0a0a1a; }
+  #hud span { color:#fff; font-weight:bold; }
+  #canvasWrap { flex:1; min-height:0; position:relative; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; outline:none; }
+  #controls { flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:4px 20px; background:#0a0a1a; }
+  .btn {
+    background:#0a0a2a; border:2px solid #00f5ff; color:#00f5ff;
+    font-size:20px; font-weight:bold; width:70px; height:44px;
+    cursor:pointer; border-radius:8px; display:flex; align-items:center; justify-content:center;
+    -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+  }
+  .btn.pressed,.btn:active { background:#00f5ff; color:#000; }
+  #tilt-hint { color:#444; font-size:9px; letter-spacing:1px; text-align:center; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <div>SCORE: <span id="scoreVal">0</span></div>
+    <div>BEST: <span id="bestVal">0</span></div>
+  </div>
+  <div id="canvasWrap">
+    <canvas id="c" tabindex="0"></canvas>
+  </div>
+  <div id="controls">
+    <button class="btn" id="btnL">◀</button>
+    <div id="tilt-hint">TAP TO START</div>
+    <button class="btn" id="btnR">▶</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const wrap = document.getElementById('canvasWrap');
+const hint = document.getElementById('tilt-hint');
+
+let W, H;
+function resize() {
+  W = canvas.width  = wrap.clientWidth  || wrap.offsetWidth  || 300;
+  H = canvas.height = wrap.clientHeight || wrap.offsetHeight || 400;
+}
+window.addEventListener('load', () => { setTimeout(() => { resize(); init(); draw(); }, 100); });
+window.addEventListener('resize', () => { resize(); });
+
+// ── CONSTANTS ─────────────────────────────────────────────
+const GRAVITY      = 0.25;
+const JUMP_VEL     = -11;
+const PLAYER_W     = 28;
+const PLAYER_H     = 28;
+const PLAT_W       = 58;
+const PLAT_H       = 10;
+const PLAT_COUNT   = 10;
+const MOVE_SPEED   = 3.5;
+
+// Platform types
+const PLAT_NORMAL  = 0;
+const PLAT_MOVING  = 1;
+const PLAT_BOUNCY  = 2;
+const PLAT_FRAGILE = 3;
+
+// Colors
+const COLORS = {
+  bg1: '#0a0a1a',
+  bg2: '#0d0d2e',
+  player: '#00f5ff',
+  playerEye: '#fff',
+  platNormal:  '#00f5ff',
+  platMoving:  '#f7c948',
+  platBouncy:  '#ff6b9d',
+  platFragile: '#ff6b6b',
+  star: 'rgba(255,255,255,',
+  score: '#00f5ff',
+};
+
+// ── STATE ─────────────────────────────────────────────────
+let player, platforms, particles, stars;
+let score, best=0, camY, running=false, started=false, dead=false;
+let keys={left:false, right:false};
+let gameInterval=null;
+const TICK_MS = 16;
+
+// Stars background
+function makeStars() {
+  stars = [];
+  for(let i=0;i<60;i++) stars.push({x:Math.random()*W, y:Math.random()*H*3, r:Math.random()*1.5+0.3, t:Math.random()});
+}
+
+function makePlatforms() {
+  platforms = [];
+  // Primera plataforma justo debajo del jugador
+  platforms.push({ x: W/2 - PLAT_W/2, y: H*0.75, w:PLAT_W, h:PLAT_H, type:PLAT_NORMAL, dx:0, broken:false, alpha:1 });
+  for(let i=1;i<PLAT_COUNT;i++) {
+    addPlatform(H*0.75 - i*(H/PLAT_COUNT * 0.85));
+  }
+}
+
+function addPlatform(y) {
+  const rand = Math.random();
+  let type = PLAT_NORMAL;
+  if (score > 500  && rand > 0.75) type = PLAT_MOVING;
+  if (score > 1000 && rand > 0.85) type = PLAT_BOUNCY;
+  if (score > 800  && rand > 0.90) type = PLAT_FRAGILE;
+
+  platforms.push({
+    x: Math.random() * (W - PLAT_W),
+    y,
+    w: PLAT_W, h: PLAT_H,
+    type,
+    dx: type===PLAT_MOVING ? (Math.random()>0.5?1:-1)*1.2 : 0,
+    broken: false,
+    alpha: 1,
+  });
+}
+
+function init() {
+  resize();
+  makeStars();
+  score = 0;
+  dead  = false;
+  document.getElementById('scoreVal').textContent = 0;
+
+  player = {
+    x: W/2 - PLAYER_W/2,
+    y: H*0.65,
+    vx: 0,
+    vy: JUMP_VEL * 0.6,
+    facing: 1, // 1=right, -1=left
+    squish: 1, // for jump squish animation
+  };
+
+  camY = 0;
+  particles = [];
+  makePlatforms();
+}
+
+// ── BUTTONS ───────────────────────────────────────────────
+function setupBtn(id, key) {
+  const btn = document.getElementById(id);
+  const on  = () => { keys[key]=true;  btn.classList.add('pressed'); };
+  const off = () => { keys[key]=false; btn.classList.remove('pressed'); };
+  btn.addEventListener('mousedown', on);
+  btn.addEventListener('mouseup', off);
+  btn.addEventListener('mouseleave', off);
+  btn.addEventListener('touchstart', e=>{e.preventDefault();on();}, {passive:false});
+  btn.addEventListener('touchend',   e=>{e.preventDefault();off();},{passive:false});
+  btn.addEventListener('touchcancel',e=>{e.preventDefault();off();},{passive:false});
+}
+setupBtn('btnL','left');
+setupBtn('btnR','right');
+
+// Keyboard
+function handleKey(e) {
+  const down = e.type==='keydown';
+  if(e.code==='ArrowLeft' ||e.code==='KeyA') { e.preventDefault(); keys.left=down; }
+  if(e.code==='ArrowRight'||e.code==='KeyD') { e.preventDefault(); keys.right=down; }
+  if(down && (e.code==='Space'||e.code==='Enter')) { e.preventDefault(); handleTap(); }
+}
+document.addEventListener('keydown', handleKey);
+document.addEventListener('keyup',   handleKey);
+canvas.addEventListener('keydown',   handleKey);
+canvas.addEventListener('keyup',     handleKey);
+
+// Tap to start / restart
+function handleTap() {
+  if(!started || dead) {
+    init();
+    started=true;
+    running=true;
+    hint.textContent='◀  ▶  to move';
+    startLoop();
+  }
+}
+canvas.addEventListener('click', () => { window.focus(); canvas.focus(); handleTap(); });
+canvas.addEventListener('touchend', e => { e.preventDefault(); handleTap(); }, {passive:false});
+
+// Tilt (mobile gyroscope)
+window.addEventListener('deviceorientation', e => {
+  if(e.gamma !== null) {
+    const tilt = e.gamma / 45; // -1 to 1
+    keys.left  = tilt < -0.2;
+    keys.right = tilt >  0.2;
+  }
+});
+
+// ── LOOP ─────────────────────────────────────────────────
+function startLoop() { stopLoop(); gameInterval=setInterval(gameStep, TICK_MS); }
+function stopLoop()  { clearInterval(gameInterval); gameInterval=null; }
+
+function gameStep() {
+  if(!running) return;
+  update();
+  draw();
+}
+
+// ── UPDATE ────────────────────────────────────────────────
+function update() {
+  if(dead) return;
+
+  // Player move
+  if(keys.left)  { player.vx -= 0.8; player.facing=-1; }
+  if(keys.right) { player.vx += 0.8; player.facing= 1; }
+  player.vx *= 0.82; // friction
+  player.vx = Math.max(-MOVE_SPEED*2, Math.min(MOVE_SPEED*2, player.vx));
+
+  player.vy += GRAVITY;
+  player.x  += player.vx;
+  player.y  += player.vy;
+
+  // Squish animation
+  if(player.vy < 0) player.squish = Math.max(0.75, player.squish - 0.05);
+  else              player.squish = Math.min(1.0,  player.squish + 0.05);
+
+  // Wrap horizontal
+  if(player.x > W)          player.x = -PLAYER_W;
+  if(player.x < -PLAYER_W)  player.x = W;
+
+  // Camera scroll — seguir al jugador cuando sube
+  const screenY = player.y - camY;
+  if(screenY < H * 0.4) {
+    const diff = H*0.4 - screenY;
+    camY     -= diff;
+    score    += Math.ceil(diff * 0.15);
+    if(score > best) best = score;
+    document.getElementById('scoreVal').textContent = score;
+    document.getElementById('bestVal').textContent  = best;
+  }
+
+  // Platforms
+  platforms.forEach(p => {
+    // Moving
+    if(p.type===PLAT_MOVING) {
+      p.x += p.dx;
+      if(p.x <= 0 || p.x+p.w >= W) p.dx *= -1;
+    }
+    // Fragile fading
+    if(p.broken) p.alpha = Math.max(0, p.alpha - 0.06);
+  });
+  platforms = platforms.filter(p => !p.broken || p.alpha > 0);
+
+  // Platform collision — solo cuando cae
+  if(player.vy > 0) {
+    for(const p of platforms) {
+      if(p.broken) continue;
+      const px = player.x, py = player.y;
+      const prevY = py - player.vy;
+      if(px+PLAYER_W > p.x && px < p.x+p.w &&
+         prevY+PLAYER_H <= p.y+4 && py+PLAYER_H >= p.y && py+PLAYER_H <= p.y+p.h+12) {
+        // Land!
+        if(p.type===PLAT_FRAGILE) { p.broken=true; }
+        player.y  = p.y - PLAYER_H;
+        player.vy = p.type===PLAT_BOUNCY ? JUMP_VEL*1.45 : JUMP_VEL;
+        player.squish = 0.65;
+        spawnLandParticles(player.x+PLAYER_W/2, player.y+PLAYER_H, p.type);
+        break;
+      }
+    }
+  }
+
+  // Spawn new platforms as camera moves up
+  const topPlat = Math.min(...platforms.map(p=>p.y));
+  if(topPlat > camY - H*0.2) {
+    addPlatform(topPlat - (H / PLAT_COUNT * (0.6+Math.random()*0.5)));
+  }
+  // Remove platforms below camera
+  platforms = platforms.filter(p => p.y < camY + H + 100);
+
+  // Particles
+  particles = particles.filter(p=>p.life>0);
+  particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=0.1;p.life--;});
+
+  // Death — caer fuera de pantalla
+  if(player.y - camY > H + 80) {
+    dead=true; running=false; stopLoop();
+    hint.textContent='TAP TO RESTART';
+    draw();
+  }
+}
+
+function spawnLandParticles(x, y, type) {
+  const colors = [COLORS.platNormal, COLORS.platMoving, COLORS.platBouncy, COLORS.platFragile];
+  const col = colors[type] || COLORS.platNormal;
+  for(let i=0;i<6;i++) {
+    const a = Math.PI + (Math.random()-0.5)*Math.PI;
+    particles.push({ x, y: y-camY, vx:Math.cos(a)*(1+Math.random()*2), vy:Math.sin(a)*(1+Math.random()*2)-1, life:18+Math.random()*10, color:col, size:2+Math.random()*2 });
+  }
+}
+
+// ── DRAW ─────────────────────────────────────────────────
+function draw() {
+  // BG gradient
+  const grd = ctx.createLinearGradient(0,0,0,H);
+  grd.addColorStop(0, '#050510');
+  grd.addColorStop(1, '#0d0d2e');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0,0,W,H);
+
+  // Stars (parallax lento)
+  stars.forEach(s => {
+    const sy = ((s.y + camY*0.15) % (H*3+100) + H*3+100) % (H*3+100) - H;
+    const twinkle = 0.4 + 0.6*Math.abs(Math.sin(Date.now()*0.001 + s.t*10));
+    ctx.fillStyle = COLORS.star + twinkle + ')';
+    ctx.beginPath();
+    ctx.arc(s.x, sy, s.r, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  if(!started) {
+    drawOverlay();
+    return;
+  }
+
+  // Platforms
+  platforms.forEach(p => {
+    const py = p.y - camY;
+    if(py > H+20 || py < -20) return;
+
+    ctx.globalAlpha = p.alpha;
+    const col = [COLORS.platNormal, COLORS.platMoving, COLORS.platBouncy, COLORS.platFragile][p.type];
+    ctx.shadowColor = col; ctx.shadowBlur = 8;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.roundRect(p.x, py, p.w, p.h, 4);
+    ctx.fill();
+
+    // Shine on top
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(p.x+4, py+2, p.w-8, 2);
+
+    // Bouncy spring indicator
+    if(p.type===PLAT_BOUNCY) {
+      ctx.fillStyle='#fff';
+      ctx.font='10px sans-serif';
+      ctx.textAlign='center';
+      ctx.fillText('⬆', p.x+p.w/2, py-2);
+      ctx.textAlign='left';
+    }
+
+    ctx.shadowBlur=0;
+    ctx.globalAlpha=1;
+  });
+
+  // Particles
+  particles.forEach(p=>{
+    ctx.globalAlpha=Math.max(0,p.life/28);
+    ctx.fillStyle=p.color;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.size,0,Math.PI*2);ctx.fill();
+  });
+  ctx.globalAlpha=1;
+
+  // Player
+  drawPlayer();
+
+  // Dead overlay
+  if(dead) drawOverlay();
+}
+
+function drawPlayer() {
+  const px = player.x;
+  const py = player.y - camY;
+  const sq = player.squish;
+  const f  = player.facing;
+
+  ctx.save();
+  ctx.translate(px + PLAYER_W/2, py + PLAYER_H/2);
+  ctx.scale(1/sq, sq); // squish effect
+
+  // Glow
+  ctx.shadowColor = COLORS.player; ctx.shadowBlur = 12;
+
+  // Body — rounded square
+  ctx.fillStyle = COLORS.player;
+  ctx.beginPath();
+  ctx.roundRect(-PLAYER_W/2, -PLAYER_H/2, PLAYER_W, PLAYER_H, 7);
+  ctx.fill();
+  ctx.shadowBlur=0;
+
+  // Face gradient
+  const fg = ctx.createLinearGradient(-PLAYER_W/2,-PLAYER_H/2,PLAYER_W/2,PLAYER_H/2);
+  fg.addColorStop(0,'rgba(255,255,255,0.3)');
+  fg.addColorStop(1,'rgba(0,0,0,0.1)');
+  ctx.fillStyle=fg;
+  ctx.beginPath();ctx.roundRect(-PLAYER_W/2,-PLAYER_H/2,PLAYER_W,PLAYER_H,7);ctx.fill();
+
+  // Eyes
+  const eyeX = f * 4;
+  ctx.fillStyle='#fff';
+  ctx.beginPath();ctx.arc(eyeX-4, -3, 4, 0, Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(eyeX+4, -3, 4, 0, Math.PI*2);ctx.fill();
+  ctx.fillStyle='#000';
+  ctx.beginPath();ctx.arc(eyeX-4+f, -3, 2, 0, Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(eyeX+4+f, -3, 2, 0, Math.PI*2);ctx.fill();
+
+  // Smile
+  ctx.strokeStyle='#000'; ctx.lineWidth=1.5;
+  ctx.beginPath();
+  ctx.arc(eyeX, 2, 4, 0.2, Math.PI-0.2);
+  ctx.stroke();
+
+  // Legs
+  ctx.fillStyle=COLORS.player;
+  ctx.fillRect(-8, PLAYER_H/2-2, 5, 5);
+  ctx.fillRect( 3, PLAYER_H/2-2, 5, 5);
+
+  ctx.restore();
+}
+
+function drawOverlay() {
+  ctx.fillStyle='rgba(0,0,0,0.72)';
+  ctx.fillRect(0,0,W,H);
+  if(!started) {
+    ctx.fillStyle='#00f5ff';
+    ctx.font="bold "+Math.max(14,Math.floor(W/12))+"px 'Courier New'";
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('🌀 SOMOS JUMP',W/2,H*0.38);
+    ctx.fillStyle='#aaa';
+    ctx.font=Math.max(9,Math.floor(W/28))+"px 'Courier New'";
+    ctx.fillText('TAP OR PRESS SPACE',W/2,H*0.52);
+    ctx.fillStyle='#555';
+    ctx.font=Math.max(8,Math.floor(W/36))+"px 'Courier New'";
+    ctx.fillText('◀ ▶  move   •  tilt on mobile',W/2,H*0.63);
+  } else if(dead) {
+    ctx.fillStyle='#ff6b6b';
+    ctx.font="bold "+Math.max(14,Math.floor(W/12))+"px 'Courier New'";
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('GAME OVER',W/2,H*0.35);
+    ctx.fillStyle='#fff';
+    ctx.font=Math.max(10,Math.floor(W/24))+"px 'Courier New'";
+    ctx.fillText('SCORE: '+score,W/2,H*0.48);
+    ctx.fillStyle='#f7c948';
+    ctx.fillText('BEST:  '+best, W/2,H*0.58);
+    ctx.fillStyle='#aaa';
+    ctx.font=Math.max(8,Math.floor(W/32))+"px 'Courier New'";
+    ctx.fillText('TAP TO RESTART',W/2,H*0.72);
+  }
+  ctx.textAlign='left';ctx.textBaseline='alphabetic';
+}
+</script>
+</body>
+</html>
